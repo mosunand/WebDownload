@@ -75,6 +75,7 @@ pip install -r requirements.txt
 **Windows:**
 
 **下载完后双击mkenv.bat文件**，进行下载必要工具，他会下载到同级别的Tools里面，不会下载到C盘
+然后下载完后就可以正式开始使用了，方式如下：
 
 ```bash
 # 方式一:双击 start.bat
@@ -91,6 +92,7 @@ python main.py
 **Linux / macOS:**
 
 **下载完后执行mkenv.sh文件**，进行下载必要工具，他会下载到同级别的Tools里面，不会下载到C盘，执行指令为：
+然后下载完后就可以正式开始使用了，方式如下：
 
 ```bash
 bash mkenv.sh
