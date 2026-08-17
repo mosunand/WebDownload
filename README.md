@@ -1,6 +1,8 @@
 # WebDownload — 资源爬虫
 
-![Logo](icon/logo.ico)
+<p align="center">
+  <img src="docs/show.ico" alt="Logo" width="600"/>
+</p>
 
 一个基于 **PySide6 + Playwright + httpx** 的桌面端网页资源抓取工具。  
 无边框 iOS 风毛玻璃 UI,真浏览器渲染扫描,支持 JS 动态加载、懒加载图片、登录态保留,并发流式下载。
