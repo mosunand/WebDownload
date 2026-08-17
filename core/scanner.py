@@ -24,7 +24,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 定位到 Tools/chromium-1140/chrome-win/chrome.exe
 CHROME_EXE = os.path.join(
     _ROOT,
-    "Tools",
+    "Tools\ms-playwright",
     "chromium-1140",
     "chrome-win",
     "chrome.exe"
