@@ -51,13 +51,13 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/moshuai1013/WebDownload.git
+[git clone https://github.com/moshuai1013/WebDownload.git](https://github.com/mosunand/WebDownload.git)
 cd WebDownload
 
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 项目已内置 Chromium(Tools/chromium-1140/),无需额外下载
+# 3. 项目可以通过运行mkenv.bat文件或者mkenv.sh文件进行自动安装 Chromium(Tools/chromium-1140/),
 #    如需自行安装 Playwright 浏览器:
 # playwright install chromium
 ```
