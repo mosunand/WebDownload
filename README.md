@@ -1,7 +1,7 @@
 # WebDownload — 资源爬虫
 
 <p align="center">
-  <img src="docs/show.ico" alt="Logo" width="600"/>
+  <img src="docs/show1.png" alt="Logo" width="600"/>
 </p>
 
 一个基于 **PySide6 + Playwright + httpx** 的桌面端网页资源抓取工具。  
