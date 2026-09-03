@@ -1,9 +1,5 @@
 # WebDownload — 资源爬虫
 
-<p align="center">
-  <img src="docs/logo.png" alt="Logo" width="600"/>
-</p>
-
 一个基于 **PySide6 + Playwright + httpx** 的桌面端网页资源抓取工具。  
 无边框 iOS 风毛玻璃 UI,真浏览器渲染扫描,支持 JS 动态加载、懒加载图片、登录态保留,并发流式下载。
 
@@ -37,9 +33,9 @@
 
 ---
 
-## 界面效果图
+## 📸 截图
 
-![界面图](docs/show1.png)
+> *(放一张运行截图到这里,建议放在 `docs/screenshot.png`)*
 
 ---
 
@@ -61,7 +57,7 @@ cd WebDownload
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 项目可以通过运行mkenv.bat文件或者mkenv.sh文件进行自动安装 Chromium(Tools/chromium-1140/),
+# 3. 项目已内置 Chromium(Tools/chromium-1140/),无需额外下载
 #    如需自行安装 Playwright 浏览器:
 # playwright install chromium
 ```
@@ -79,7 +75,6 @@ pip install -r requirements.txt
 **Windows:**
 
 **下载完后双击mkenv.bat文件**，进行下载必要工具，他会下载到同级别的Tools里面，不会下载到C盘
-然后下载完后就可以正式开始使用了，方式如下：
 
 ```bash
 # 方式一:双击 start.bat
@@ -96,7 +91,6 @@ python main.py
 **Linux / macOS:**
 
 **下载完后执行mkenv.sh文件**，进行下载必要工具，他会下载到同级别的Tools里面，不会下载到C盘，执行指令为：
-然后下载完后就可以正式开始使用了，方式如下：
 
 ```bash
 bash mkenv.sh
@@ -128,7 +122,7 @@ chmod +x start.sh
 
 <strong style="color:red;">如果需要打开某个按钮，例如“图片”按钮，不是通过点击按钮，而是通过<u>点击文字末尾，例如"片"字</u>，这样就可以进行开关这个按钮了</strong>
 
-![展示操作](docs/show2.png)
+
 
 ### 需要登录的网站
 

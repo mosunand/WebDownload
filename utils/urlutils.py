@@ -14,10 +14,10 @@ AUDIO_EXTS = {
 }
 VIDEO_EXTS = {
     ".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v", ".ogv", ".wmv",
-    ".flv", ".3gp", ".ts", ".m3u8",
+    ".flv", ".3gp", ".ts", ".m3u8", ".m4s", ".mpd",
 }
-CSS_EXTS = {"css"}
-JS_EXTS = {"js", "mjs", "cjs"}
+CSS_EXTS = {".css"}
+JS_EXTS = {".js", ".mjs", ".cjs"}
 
 # content-type 主类型 -> 资源类别
 _CONTENT_TYPE_MAP = {
@@ -27,6 +27,16 @@ _CONTENT_TYPE_MAP = {
     "text/css": "css",
     "javascript": "js",
     "ecmascript": "js",
+}
+
+# content-type 全匹配(特殊类型)
+_CONTENT_TYPE_EXACT = {
+    "application/vnd.apple.mpegurl": "video",   # HLS m3u8
+    "application/x-mpegurl": "video",            # HLS m3u8
+    "audio/mpegurl": "video",                    # HLS m3u8 (某些服务器返回)
+    "application/dash+xml": "video",             # DASH mpd
+    "application/vnd.ms-sstr+xml": "video",     # Smooth Streaming
+    "application/x-mpegURL": "video",            # HLS (大小写变体)
 }
 
 
@@ -54,11 +64,11 @@ def is_data_url(url: str) -> bool:
 
 
 def get_ext(url: str) -> str:
-    """从 URL 路径取扩展名(小写,不含点)。查询串里的 ext 不算。"""
+    """从 URL 路径取扩展名(小写,带点)。查询串里的 ext 不算。"""
     try:
         path = urlparse(url).path
         if "." in path:
-            return path.rsplit(".", 1)[-1].lower()
+            return "." + path.rsplit(".", 1)[-1].lower()
     except Exception:
         pass
     return ""
@@ -73,6 +83,9 @@ def classify(url: str, content_type: str | None = None) -> str | None:
     # content-type 优先
     if content_type:
         ct = content_type.split(";")[0].strip().lower()
+        # 全匹配(HLS/DASH 等特殊类型)
+        if ct in _CONTENT_TYPE_EXACT:
+            return _CONTENT_TYPE_EXACT[ct]
         # 精确匹配 text/css、application/javascript 等
         if ct in _CONTENT_TYPE_MAP:
             return _CONTENT_TYPE_MAP[ct]

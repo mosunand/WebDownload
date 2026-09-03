@@ -15,6 +15,7 @@ from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
 from utils.urlutils import classify, normalize_url, is_data_url
+from utils.stream_parser import parse_stream_manifest, is_stream_manifest
 
 import os
 
@@ -24,7 +25,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 定位到 Tools/chromium-1140/chrome-win/chrome.exe
 CHROME_EXE = os.path.join(
     _ROOT,
-    "Tools\ms-playwright",
+    "Tools",
     "chromium-1140",
     "chrome-win",
     "chrome.exe"
@@ -108,7 +109,18 @@ _EXTRACT_JS = r"""
         if (v.poster) out.images.push(abs(v.poster));
     });
     document.querySelectorAll('video source[src]').forEach(s => {
+        const type = (s.getAttribute('type') || '').toLowerCase();
+        // HLS / DASH source 也加入 video 列表,供后续解析
         out.video.push(abs(s.getAttribute('src')));
+    });
+
+    // <source> 标签中 type 为 application/x-mpegURL 或 application/dash+xml 的
+    document.querySelectorAll('source[type]').forEach(s => {
+        const type = (s.getAttribute('type') || '').toLowerCase();
+        if (type.includes('mpegurl') || type.includes('dash') || type.includes('hls')) {
+            const src = s.getAttribute('src');
+            if (src) out.video.push(abs(src));
+        }
     });
 
     // CSS / JS
@@ -144,6 +156,7 @@ class ResourceScanner:
         self.timeout_ms = timeout_ms
         self.user_data_dir = user_data_dir or _DEFAULT_USER_DATA
         self.scroll_rounds = scroll_rounds
+        self._parsed_manifests: set[str] = set()
 
     # ---- 内部:渐进滚动,触发懒加载/无限滚动 ----
     def _auto_scroll(self, page):
@@ -267,6 +280,12 @@ class ResourceScanner:
             except Exception:
                 result["html"] = ""
 
+            # 7) 提取页面标题(JS 动态渲染的页面也能拿到)
+            try:
+                result["title"] = page.title() or ""
+            except Exception:
+                result["title"] = ""
+
             try:
                 context.close()
             except Exception:
@@ -303,4 +322,43 @@ class ResourceScanner:
         for cat in merged:
             result[cat] = sorted(merged[cat])
 
+        # ---- 流媒体清单二次解析:HLS(.m3u8) / DASH(.mpd) ----
+        # 清单本身保留(可下载),同时把里面的 TS/M4S 分片也加进 video 列表
+        result["video"] = self._expand_stream_manifests(result["video"])
+
         return result
+
+    def _expand_stream_manifests(self, video_urls: list[str]) -> list[str]:
+        """把 video 列表里的 .m3u8/.mpd 清单解析成分片 URL,合并回列表。
+
+        - 清单 URL 本身保留(用户可直接下载清单文件)
+        - 解析出的分片(.ts/.m4s)追加到列表,便于并发下载
+        - 解析失败不影响原清单下载
+        """
+        if not video_urls:
+            return video_urls
+
+        out = list(video_urls)
+        seen: set[str] = set(out)
+        parsed_count = 0
+
+        for u in video_urls:
+            if not is_stream_manifest(u) or u in self._parsed_manifests:
+                continue
+            self._parsed_manifests.add(u)
+            segments = parse_stream_manifest(u)
+            if not segments:
+                continue
+            parsed_count += 1
+            for seg in segments:
+                if seg not in seen:
+                    seen.add(seg)
+                    out.append(seg)
+            # 稍作提示:每解析一个清单只打一条日志,不刷屏
+            if parsed_count <= 5:
+                print(f"[stream] 解析 {u} → {len(segments)} 个分片")
+
+        if parsed_count:
+            print(f"[stream] 共展开 {parsed_count} 个流媒体清单,视频资源 {len(out)} 个")
+
+        return out
