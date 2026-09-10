@@ -77,6 +77,8 @@ def parse_m3u8(content: str, base_url: str) -> M3U8Playlist:
     current_key_iv: str | None = None
     current_duration: float = 0.0
     segment_count = 0
+    # 主清单的码率变体表:(带宽, 分辨率像素数, 子清单 URL)
+    variants: list[tuple[int, int, str]] = []
 
     i = 0
     while i < len(lines):
@@ -87,26 +89,26 @@ def parse_m3u8(content: str, base_url: str) -> M3U8Playlist:
             i += 1
             continue
 
-        # 主清单标记:包含多个码率流,递归解析最高码率的那条
+        # 主清单标记:包含多个码率流,先收集,循环结束后只解析最高码率的那条
+        # (如果全解析,不同码率的分片会混进同一列表,合并时顺序错乱)
         if line.startswith("#EXT-X-STREAM-INF"):
             playlist.is_master = True
-            # 解析属性
             attrs = _parse_attrs(line)
+            bandwidth = _safe_int(attrs.get("BANDWIDTH") or attrs.get("AVERAGE-BANDWIDTH"))
+            resolution = 0
+            res_str = attrs.get("RESOLUTION", "")
+            if res_str:
+                try:
+                    w, h = res_str.lower().split("x", 1)
+                    resolution = int(w) * int(h)
+                except ValueError:
+                    resolution = 0
             # 下一行就是子清单 URL
             i += 1
-            if i < len(lines):
+            if i < len(lines) and not lines[i].strip().startswith("#"):
                 child_url = _resolve(base_url, lines[i].strip())
                 if child_url:
-                    # 递归:下载并解析子清单
-                    child_content = _fetch_text(child_url)
-                    if child_content:
-                        child = parse_m3u8(child_content, child_url)
-                        playlist.segments.extend(child.segments)
-                        if child.target_duration:
-                            playlist.target_duration = child.target_duration
-                        # 如果已经有足够分片,可以提前结束
-                        if len(playlist.segments) >= MAX_SEGMENTS:
-                            break
+                    variants.append((bandwidth, resolution, child_url))
             i += 1
             continue
 
@@ -136,6 +138,17 @@ def parse_m3u8(content: str, base_url: str) -> M3U8Playlist:
             else:
                 current_key_url = None
                 current_key_iv = None
+            i += 1
+            continue
+
+        # EXT-X-MAP: fMP4 HLS 的初始化段(moov 头)。
+        # 它出现在所属分片之前,按遇到顺序追加即可保证排在最前
+        if line.startswith("#EXT-X-MAP"):
+            attrs = _parse_attrs(line)
+            init_url = _resolve(base_url, attrs.get("URI", ""))
+            if init_url:
+                playlist.segments.append(M3U8Segment(url=init_url, duration=0.0))
+                segment_count += 1
             i += 1
             continue
 
@@ -199,6 +212,24 @@ def parse_m3u8(content: str, base_url: str) -> M3U8Playlist:
 
         # 其他标签: #EXT-X-ENDLIST, #EXT-X-DISCONTINUITY 等 — 忽略
         i += 1
+
+    # 主清单:只解析最高码率(带宽优先,分辨率兜底)的那一个变体。
+    # 从高到低依次尝试,某个变体下载失败或没有分片时降级到下一档。
+    if variants:
+        variants.sort(key=lambda v: (v[0], v[1]), reverse=True)
+        for _, _, child_url in variants:
+            child_content = _fetch_text(child_url)
+            if not child_content:
+                continue
+            child = parse_m3u8(child_content, child_url)
+            if not child.segments:
+                continue
+            if child.target_duration:
+                playlist.target_duration = child.target_duration
+            remaining = MAX_SEGMENTS - len(playlist.segments)
+            if remaining > 0:
+                playlist.segments.extend(child.segments[:remaining])
+            break
 
     return playlist
 
@@ -284,6 +315,11 @@ def parse_mpd(content: str, base_url: str) -> MPDPlaylist:
     if mbt:
         playlist.min_buffer_time = _parse_duration(mbt)
 
+    # 便利函数:给标签加命名空间前缀(必须定义在所有使用点之前,
+    # 原代码把 def tag 放在了使用它的 Period 兜底循环之后,会触发 NameError)
+    def tag(name: str) -> str:
+        return f"{{{ns}}}{name}" if ns else name
+
     # 取媒体演示总时长(秒),用于在无 SegmentTimeline 时估算分片数量
     mpd_duration = 0.0
     dur_attr = root.get("mediaPresentationDuration") or root.get("minimumUpdatePeriod")
@@ -291,71 +327,107 @@ def parse_mpd(content: str, base_url: str) -> MPDPlaylist:
         mpd_duration = _parse_duration(dur_attr)
     # 兜底:从 Period 的 duration 属性取
     if mpd_duration <= 0:
-        for period in root.findall(f".//{tag('Period')}") if ns else root.findall(".//Period"):
+        for period in root.findall(f".//{tag('Period')}"):
             pd = period.get("duration")
             if pd:
                 mpd_duration = _parse_duration(pd)
                 break
 
-    # 便利函数:给标签加命名空间前缀
+    # 收集所有 (AdaptationSet, Representation) 组合,优先选视频
+    def _is_video_pair(aset_el: ET.Element, rep_el: ET.Element) -> bool:
+        for el in (aset_el, rep_el):
+            if "video" in (el.get("mimeType") or ""):
+                return True
+        # mimeType 可能只在兄弟 Representation 上
+        return any(
+            "video" in (r.get("mimeType") or "")
+            for r in aset_el.findall(tag("Representation"))
+        )
+
+    pairs = [
+        (aset_el, rep_el)
+        for aset_el in root.findall(f".//{tag('AdaptationSet')}")
+        for rep_el in aset_el.findall(tag("Representation"))
+    ]
+    video_pairs = [pr for pr in pairs if _is_video_pair(*pr)] or pairs
+    if not video_pairs:
+        return playlist
+
+    # 只取全局带宽最高的那一个 Representation:
+    # 多个 AdaptationSet / Representation 是同一内容的不同码率或编码,
+    # 全部解析会让不同码率的分片交叉,合并后顺序错乱
+    best_aset, best_rep = max(video_pairs, key=lambda pr: _safe_int(pr[1].get("bandwidth")))
+
+    _resolve_mpd_representation(best_rep, best_aset, base_url, playlist, mpd_duration)
+
+    return playlist
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """安全转 int,失败返回 default。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _expand_media_tpl(tpl: str, rep_id: str, bandwidth: str,
+                      seg_num: int, time_val: int) -> str:
+    """替换 SegmentTemplate 中的 $Number$ / $RepresentationID$ / $Bandwidth$ / $Time$ 变量。"""
+    s = tpl.replace("$RepresentationID$", rep_id)
+    s = s.replace("$Bandwidth$", bandwidth)
+    s = s.replace("$Number$", str(seg_num))
+    s = s.replace("$Time$", str(time_val))
+    # 带格式的数字变量,如 $Number%05d$
+    return re.sub(r"\$Number%(\d+)d\$", lambda m: str(seg_num).zfill(int(m.group(1))), s)
+
+
+def _resolve_mpd_representation(
+    rep: ET.Element,
+    aset: ET.Element,
+    base_url: str,
+    playlist: MPDPlaylist,
+    mpd_duration: float = 0.0,
+):
+    """解析单个 Representation 的分片集合。
+
+    SegmentTemplate / SegmentList 可能挂在 Representation 上,
+    也可能从父级 AdaptationSet 继承,两级都找。
+    """
+    ns = _resolve_mpd_ns(rep.tag)
+
     def tag(name: str) -> str:
         return f"{{{ns}}}{name}" if ns else name
 
-    # 遍历所有 AdaptationSet, 优先选视频
-    for aset in root.findall(f".//{tag('AdaptationSet')}"):
-        mime_type = aset.get("mimeType", "")
-        if "video" not in mime_type:
-            continue
+    seg_template = rep.find(tag("SegmentTemplate"))
+    if seg_template is None:
+        seg_template = aset.find(tag("SegmentTemplate"))
+    if seg_template is not None:
+        _resolve_mpd_template(seg_template, rep, aset, base_url, playlist, mpd_duration)
+        return
 
-        # 选最高码率的 Representation
-        best_rep = None
-        best_bandwidth = -1
-        for rep in aset.findall(tag("Representation")):
-            bw = int(rep.get("bandwidth", 0) or 0)
-            if bw > best_bandwidth:
-                best_bandwidth = bw
-                best_rep = rep
+    seg_list = rep.find(tag("SegmentList"))
+    if seg_list is None:
+        seg_list = aset.find(tag("SegmentList"))
+    if seg_list is not None:
+        _resolve_mpd_segment_list(seg_list, rep, base_url, playlist)
+        return
 
-        if best_rep is None:
-            continue
+    seg_timeline = rep.find(tag("SegmentTimeline"))
+    if seg_timeline is None:
+        seg_timeline = aset.find(tag("SegmentTimeline"))
+    if seg_timeline is not None:
+        _resolve_mpd_timeline(seg_timeline, rep, aset, base_url, playlist)
+        return
 
-        # 解析分片模板
-        seg_template = best_rep.find(tag("SegmentTemplate"))
-        if seg_template is not None:
-            _resolve_mpd_template(seg_template, best_rep, base_url, playlist, mpd_duration)
-            continue
-
-        # 解析分片列表
-        seg_list = best_rep.find(tag("SegmentList"))
-        if seg_list is not None:
-            _resolve_mpd_segment_list(seg_list, best_rep, base_url, playlist)
-            continue
-
-        # 解析分片时间线
-        seg_timeline = best_rep.find(tag("SegmentTimeline"))
-        if seg_timeline is not None:
-            _resolve_mpd_timeline(seg_timeline, best_rep, base_url, playlist)
-            continue
-
-        # 如果都没有,尝试直接取 BaseURL
-        base_url_el = best_rep.find(tag("BaseURL"))
-        if base_url_el is not None and base_url_el.text:
-            url = _resolve(base_url, base_url_el.text.strip())
-            if url:
-                playlist.segments.append(MPDSegment(url=url))
-
-    # 如果没有找到视频流,回退到所有流
-    if not playlist.segments:
-        for aset in root.findall(f".//{tag('AdaptationSet')}"):
-            for rep in aset.findall(tag("Representation")):
-                seg_template = rep.find(tag("SegmentTemplate"))
-                if seg_template is not None:
-                    _resolve_mpd_template(seg_template, rep, base_url, playlist, mpd_duration)
-                seg_list = rep.find(tag("SegmentList"))
-                if seg_list is not None:
-                    _resolve_mpd_segment_list(seg_list, rep, base_url, playlist)
-
-    return playlist
+    # 如果都没有,尝试直接取 BaseURL
+    base_url_el = rep.find(tag("BaseURL"))
+    if base_url_el is None:
+        base_url_el = aset.find(tag("BaseURL"))
+    if base_url_el is not None and base_url_el.text:
+        url = _resolve(base_url, base_url_el.text.strip())
+        if url:
+            playlist.segments.append(MPDSegment(url=url))
 
 
 def _resolve_mpd_ns(tag: str) -> str:
@@ -367,56 +439,54 @@ def _resolve_mpd_ns(tag: str) -> str:
 def _resolve_mpd_template(
     template: ET.Element,
     rep: ET.Element,
+    aset: ET.Element,
     base_url: str,
     playlist: MPDPlaylist,
     mpd_duration: float = 0.0,
 ):
-    """解析 SegmentTemplate,展开分片 URL。"""
-    start_number = int(template.get("startNumber", 1) or 1)
-    duration = int(template.get("duration", 0) or 0)  # 在 timescale 下的单位
-    timescale = int(template.get("timescale", 1) or 1)
+    """解析 SegmentTemplate,展开分片 URL(含初始化分片)。"""
+    start_number = _safe_int(template.get("startNumber"), 1) or 1
+    duration = _safe_int(template.get("duration"))  # 在 timescale 下的单位
+    timescale = _safe_int(template.get("timescale"), 1) or 1
     media_tpl = template.get("media", "")
 
     rep_id = rep.get("id", "")
     bandwidth = rep.get("bandwidth", "0")
 
-    # 检查 rep 下是否有 SegmentTimeline 子元素(精确的时间点列表,与 SegmentTemplate 平级)
+    # 检查 SegmentTimeline 子元素(精确的时间点列表,可能在 rep 或 aset 上)
     ns = _resolve_mpd_ns(rep.tag)
     seg_timeline_tag = f"{{{ns}}}SegmentTimeline" if ns else "SegmentTimeline"
     timeline = rep.find(seg_timeline_tag)
+    if timeline is None:
+        timeline = aset.find(seg_timeline_tag)
     if timeline is not None:
-        _resolve_mpd_timeline(timeline, rep, base_url, playlist)
+        _resolve_mpd_timeline(timeline, rep, aset, base_url, playlist)
         return
 
     # 如果没有分片总数标记,默认拉取一个合理的数量
     total = 0
     total_str = template.get("endNumber", "")
     if total_str:
-        total = int(total_str) - start_number + 1
+        total = _safe_int(total_str) - start_number + 1
     elif duration > 0 and mpd_duration > 0:
         # 从 mediaPresentationDuration 推算:总时长 / 单分片时长(秒) + 1 容错
         import math
         total = int(math.ceil(mpd_duration * timescale / duration)) + 1
         total = min(total, MAX_SEGMENTS)
-    elif duration == 0:
-        total = 1
     else:
         total = 1
 
+    # 初始化分片(fMP4 的 moov 头,缺了它合并出的 MP4 无法播放)
+    init_tpl = template.get("initialization", "")
+    if init_tpl:
+        url = _resolve(base_url, _expand_media_tpl(init_tpl, rep_id, bandwidth, start_number, 0))
+        if url:
+            playlist.segments.append(MPDSegment(url=url))
+
     for i in range(min(total, MAX_SEGMENTS)):
         seg_num = start_number + i
-        # 替换模板变量
-        url_str = media_tpl
-        url_str = url_str.replace("$Number$", str(seg_num))
-        url_str = url_str.replace("$RepresentationID$", rep_id)
-        url_str = url_str.replace("$Bandwidth$", bandwidth)
-        # 处理带格式的数字,如 $Number%05d$
-        url_str = re.sub(r"\$Number%([\d]+)d\$", lambda m: str(seg_num).zfill(int(m.group(1))), url_str)
-        # 处理 Time 变量
         time_val = (seg_num - start_number) * duration
-        url_str = url_str.replace("$Time$", str(time_val))
-
-        url = _resolve(base_url, url_str)
+        url = _resolve(base_url, _expand_media_tpl(media_tpl, rep_id, bandwidth, seg_num, time_val))
         if url:
             playlist.segments.append(MPDSegment(
                 url=url,
@@ -436,6 +506,15 @@ def _resolve_mpd_segment_list(
     def tag(name: str) -> str:
         return f"{{{ns}}}{name}" if ns else name
 
+    # 初始化分片
+    init_el = seg_list.find(tag("Initialization"))
+    if init_el is not None:
+        src = init_el.get("sourceURL", "")
+        if src:
+            url = _resolve(base_url, src)
+            if url:
+                playlist.segments.append(MPDSegment(url=url))
+
     for seg_url in seg_list.findall(tag("SegmentURL")):
         media = seg_url.get("media", "")
         if media:
@@ -447,25 +526,25 @@ def _resolve_mpd_segment_list(
 def _resolve_mpd_timeline(
     timeline: ET.Element,
     rep: ET.Element,
+    aset: ET.Element,
     base_url: str,
     playlist: MPDPlaylist,
 ):
-    """解析 SegmentTimeline,提取分片 URL。"""
+    """解析 SegmentTimeline,按时间顺序提取分片 URL。"""
     ns = _resolve_mpd_ns(rep.tag)
-    template = rep.find(f"{{{ns}}}SegmentTemplate") if ns else rep.find("SegmentTemplate")
-    if template is None:
-        # 尝试在父级找
-        parent = _find_parent_with_template(rep)
-        if parent is not None:
-            template = parent.find(f"{{{ns}}}SegmentTemplate") if ns else parent.find("SegmentTemplate")
-    if template is None:
-        return
 
     def tag(name: str) -> str:
         return f"{{{ns}}}{name}" if ns else name
 
-    start_number = int(template.get("startNumber", 1) or 1)
-    timescale = int(template.get("timescale", 1) or 1)
+    # SegmentTemplate 可能在 rep 上,也可能从父级 aset 继承
+    template = rep.find(tag("SegmentTemplate"))
+    if template is None:
+        template = aset.find(tag("SegmentTemplate"))
+    if template is None:
+        return
+
+    start_number = _safe_int(template.get("startNumber"), 1) or 1
+    timescale = _safe_int(template.get("timescale"), 1) or 1
     media_tpl = template.get("media", "")
 
     rep_id = rep.get("id", "")
@@ -473,27 +552,26 @@ def _resolve_mpd_timeline(
     seg_num = start_number
     current_time = 0
 
+    # 初始化分片
+    init_tpl = template.get("initialization", "")
+    if init_tpl:
+        url = _resolve(base_url, _expand_media_tpl(init_tpl, rep_id, bandwidth, seg_num, 0))
+        if url:
+            playlist.segments.append(MPDSegment(url=url))
+
     for s_elem in timeline.findall(tag("S")):
-        d = int(s_elem.get("d", 0) or 0)
-        r = int(s_elem.get("r", 0) or 0)  # 重复次数
+        d = _safe_int(s_elem.get("d"))  # 单分片时长(timescale 单位)
+        r = _safe_int(s_elem.get("r"))  # 重复次数
         t = s_elem.get("t")
 
         if t is not None:
-            current_time = int(t)
+            current_time = _safe_int(t)
 
         for _ in range(min(r + 1, MAX_SEGMENTS)):
-            url_str = media_tpl
-            url_str = url_str.replace("$Number$", str(seg_num))
-            url_str = url_str.replace("$RepresentationID$", rep_id)
-            url_str = url_str.replace("$Bandwidth$", bandwidth)
-            url_str = url_str.replace("$Time$", str(current_time))
-            url_str = re.sub(
-                r"\$Number%([\d]+)d\$",
-                lambda m: str(seg_num).zfill(int(m.group(1))),
-                url_str,
+            url = _resolve(
+                base_url,
+                _expand_media_tpl(media_tpl, rep_id, bandwidth, seg_num, current_time),
             )
-
-            url = _resolve(base_url, url_str)
             if url:
                 playlist.segments.append(MPDSegment(
                     url=url,
@@ -506,20 +584,6 @@ def _resolve_mpd_timeline(
 
             if len(playlist.segments) >= MAX_SEGMENTS:
                 return
-
-
-def _find_parent_with_template(elem: ET.Element) -> ET.Element | None:
-    """向上查找包含 SegmentTemplate 的父元素。"""
-    parent_map = {c: p for p in elem.iter() for c in p}
-    cur = elem
-    while cur in parent_map:
-        cur = parent_map[cur]
-        ns = _resolve_mpd_ns(cur.tag)
-        def tag(name: str) -> str:
-            return f"{{{ns}}}{name}" if ns else name
-        if cur.find(tag("SegmentTemplate")) is not None:
-            return cur
-    return None
 
 
 # ──────────────────────────────────────────────

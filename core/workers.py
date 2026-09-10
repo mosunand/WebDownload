@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from core.downloader import ConcurrentDownloader
 from core.scanner import ResourceScanner, CHROME_EXE, _DEFAULT_USER_DATA
-from utils.urlutils import safe_filename
+from utils.urlutils import safe_filename, natural_key
 from utils.stream_parser import is_stream_manifest
 from datetime import datetime
 from urllib.parse import urlparse
@@ -127,14 +127,37 @@ class DownloadWorker(QObject):
         self.webaddr = webaddr
         self._stop = False
         self._downloader = ConcurrentDownloader(max_workers=max_workers)
+        # URL → 实际保存路径(下载回调时记录)。
+        # 分片文件名可能与播放顺序无关(冲突加序号/无数字名),
+        # 合并时靠这个映射按清单顺序还原,而不是靠文件名排序。
+        self._url_to_path: dict[str, str] = {}
+        # 扫描阶段解析出的 {清单URL: 有序分片URL列表},合并顺序的权威来源
+        self._stream_playlists: dict[str, list[str]] = {
+            str(m): list(segs)
+            for m, segs in (resources.get("stream_playlists") or {}).items()
+        }
 
     def stop(self):
         self._stop = True
         self._downloader.stop()
+        # 正在运行的 ffmpeg 合并也一并取消,避免后台残留长任务
+        try:
+            from utils.merger import cancel_pending_merge
+            cancel_pending_merge()
+        except Exception:
+            pass
 
     def _try_merge_video(self, session_dir: str, title: str = "") -> int:
-        """尝试把 video/ 子目录下的分片合并为单个 MP4,合并后删除碎片。"""
-        from utils.merger import _find_ffmpeg, merge_video_files, cleanup_segments
+        """把 video/ 子目录下的分片合并为 MP4,合并后删除碎片。
+
+        顺序策略(修复合并后画面顺序错乱的问题):
+        1. 优先按清单(m3u8/mpd)里的播放顺序拼接 —— 通过下载时记录的
+           URL→本地路径映射还原顺序,与文件名无关
+        2. 没有清单信息的散分片,按文件名自然排序(seg-2 排在 seg-10 前),
+           并按扩展名分组,避免不同来源的分片混在一起
+        3. 多个清单各合并成独立的 MP4,不互相混拼
+        """
+        from utils.merger import _find_ffmpeg, merge_video_files
 
         video_dir = os.path.join(session_dir, "video")
         if not os.path.isdir(video_dir):
@@ -146,49 +169,85 @@ class DownloadWorker(QObject):
             return 0
 
         all_files = os.listdir(video_dir)
-        ts_files = sorted(f for f in all_files if f.endswith(".ts"))
-        m4s_files = sorted(f for f in all_files if f.endswith((".m4s", ".m4v")))
-
-        # 如果已经有 MP4 了(之前合并过),跳过
-        existing_mp4 = [f for f in all_files if f.endswith(".mp4")]
-        if existing_mp4:
-            return 0
 
         # 用网页标题作为文件名,无标题则用默认名
         safe_title = _safe_title(title) if title else ""
         base_name = safe_title if safe_title else "merged"
 
+        # ── 1. 按清单顺序制定合并计划(每个清单一个 MP4) ──
+        plans: list[list[str]] = []
+        claimed: set[str] = set()
+
+        for seg_urls in self._stream_playlists.values():
+            seg_paths: list[str] = []
+            for u in seg_urls:
+                p = self._url_to_path.get(u)
+                if not p or p in claimed or not os.path.isfile(p):
+                    continue
+                if os.path.splitext(p)[1].lower() in (".m3u8", ".mpd"):
+                    continue  # 清单本身不是分片
+                seg_paths.append(p)
+            if len(seg_paths) >= 2:
+                claimed.update(seg_paths)
+                plans.append(seg_paths)
+
+        # ── 2. 清单没覆盖的散分片:按扩展名分组 + 自然排序 ──
+        def group_leftovers(exts: tuple[str, ...], include_init_mp4: bool = False) -> list[str]:
+            files = []
+            for f in all_files:
+                fp = os.path.join(video_dir, f)
+                if fp in claimed:
+                    continue
+                ext = os.path.splitext(f)[1].lower()
+                if ext in exts or (include_init_mp4 and ext == ".mp4" and "init" in f.lower()):
+                    files.append(fp)
+            return sorted(files, key=lambda p: natural_key(os.path.basename(p)))
+
+        ts_left = group_leftovers((".ts",), include_init_mp4=False)
+        m4s_left = group_leftovers((".m4s", ".m4v"), include_init_mp4=True)
+        if len(ts_left) >= 2:
+            plans.append(ts_left)
+        if len(m4s_left) >= 2:
+            plans.append(m4s_left)
+
+        # ── 3. 执行合并 ──
         merged_count = 0
-
-        # 只合并一次:按分片类型合并
-        if len(ts_files) >= 2:
-            seg_paths = [os.path.join(video_dir, f) for f in ts_files]
-            out_name = f"{base_name}.mp4"
+        merged_paths: list[str] = []
+        multi = len(plans) > 1
+        used_names: set[str] = set(all_files)
+        for idx, seg_paths in enumerate(plans, 1):
+            out_name = f"{base_name}_{idx}.mp4" if multi else f"{base_name}.mp4"
+            # 输出名撞上页面直接下载的文件时加后缀,不覆盖(ffmpeg -y 会覆盖)
+            stem, ext = os.path.splitext(out_name)
+            i = 1
+            while out_name in used_names:
+                out_name = f"{stem}_{i}{ext}"
+                i += 1
+            used_names.add(out_name)
             out_path = os.path.join(video_dir, out_name)
-            self.log.emit(f"正在合并 {len(ts_files)} 个 TS 分片 → {out_name}")
-            ok = merge_video_files(seg_paths, out_path, ffmpeg)
-            if ok:
+            self.log.emit(f"正在按播放顺序合并 {len(seg_paths)} 个分片 → {out_name}")
+            if merge_video_files(seg_paths, out_path, ffmpeg):
                 merged_count += 1
+                merged_paths.extend(seg_paths)
                 self.log.emit(f"  ✓ {out_name} 合并成功")
             else:
-                self.log.emit(f"  ⚠ TS 合并失败")
+                self.log.emit(f"  ⚠ {out_name} 合并失败")
 
-        elif len(m4s_files) >= 2:
-            seg_paths = [os.path.join(video_dir, f) for f in m4s_files]
-            out_name = f"{base_name}.mp4"
-            out_path = os.path.join(video_dir, out_name)
-            self.log.emit(f"正在合并 {len(m4s_files)} 个 M4S 分片 → {out_name}")
-            ok = merge_video_files(seg_paths, out_path, ffmpeg)
-            if ok:
-                merged_count += 1
-                self.log.emit(f"  ✓ {out_name} 合并成功")
-            else:
-                self.log.emit(f"  ⚠ M4S 合并失败")
-
-        # 合并成功 → 删除分片和清单,只保留 MP4
+        # ── 4. 清理:只删已成功合并的分片;全部成功时连清单一起删 ──
         if merged_count > 0:
-            removed = cleanup_segments(video_dir)
-            if removed > 0:
+            to_remove = set(merged_paths)
+            if merged_count == len(plans):
+                for f in all_files:
+                    if f.lower().endswith((".m3u8", ".mpd")) or f.endswith(".concat.txt"):
+                        to_remove.add(os.path.join(video_dir, f))
+            removed = 0
+            for p in to_remove:
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+            if removed:
                 self.log.emit(f"已清理 {removed} 个临时分片文件")
 
         return merged_count
@@ -269,6 +328,8 @@ class DownloadWorker(QObject):
 
                 def on_file_done(url, ok, save_path):
                     nonlocal ok_count, fail_count
+                    if url and save_path:
+                        self._url_to_path[url] = save_path
                     if ok:
                         ok_count += 1
                     else:
@@ -277,7 +338,8 @@ class DownloadWorker(QObject):
                     name = os.path.basename(save_path) if save_path else "?"
                     self.total_progress.emit(done[0], total, name)
 
-                ok, fail = self._downloader.download_all(
+                # 计数与进度都在 on_file_done 回调里完成,返回值不需要
+                self._downloader.download_all(
                     urls=urls,
                     base_dir=session_dir,   # ← 关键：用 session_dir 代替 save_dir
                     type_key=t,

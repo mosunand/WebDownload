@@ -10,6 +10,8 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
+import time
 import logging
 
 from utils.urlutils import get_ext
@@ -18,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Windows 隐藏 ffmpeg 命令行窗口
 _NO_WINDOW = 0x08000000 if platform.system() == "Windows" else 0
+
+# 取消事件:下载被取消/窗口被关闭时置位,正在运行的 ffmpeg 会被 kill
+_MERGE_CANCEL = threading.Event()
 
 # ffmpeg 搜索路径(项目内置)
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,12 +55,35 @@ def _find_ffmpeg() -> str | None:
     return None
 
 
+def cancel_pending_merge() -> None:
+    """请求取消正在进行的合并(kill 运行中的 ffmpeg)。"""
+    _MERGE_CANCEL.set()
+
+
 def _run_ffmpeg(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
-    """执行 ffmpeg 命令,隐藏窗口,返回结果。"""
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout,
+    """执行 ffmpeg 命令,可被取消事件中断,超时/取消时 kill 进程。
+
+    输出重定向到 DEVNULL:本工具只关心退出码,而 ffmpeg 会持续向
+    stderr 写进度,用管道的话长合并可能把管道写满导致卡死。
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         creationflags=_NO_WINDOW,
     )
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None:
+        if _MERGE_CANCEL.is_set():
+            proc.kill()
+            break
+        if time.monotonic() >= deadline:
+            proc.kill()
+            break
+        time.sleep(0.2)
+    proc.wait()
+    rc = proc.returncode if proc.returncode is not None else 1
+    return subprocess.CompletedProcess(cmd, returncode=rc)
 
 
 def merge_video_files(
@@ -63,13 +91,19 @@ def merge_video_files(
     output_path: str,
     ffmpeg_path: str | None = None,
 ) -> bool:
-    """把一组视频分片文件合并为单个 MP4。"""
+    """把一组视频分片文件合并为单个 MP4。
+
+    注意:file_paths 的顺序即拼接顺序,调用方必须保证它就是播放顺序。
+    """
     if not file_paths:
         return False
 
     ffmpeg = ffmpeg_path or _find_ffmpeg()
     if not ffmpeg:
         return False
+
+    # 新一轮合并前清掉上一轮可能残留的取消标记
+    _MERGE_CANCEL.clear()
 
     ext = get_ext(file_paths[0]).lower()
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -86,105 +120,6 @@ def merge_video_files(
         return False
 
 
-def merge_by_manifest(
-    manifest_path: str,
-    output_path: str,
-    ffmpeg_path: str | None = None,
-) -> bool:
-    """用 ffmpeg 读取清单文件合并。清单失败时回退到 concat demuxer。"""
-    ffmpeg = ffmpeg_path or _find_ffmpeg()
-    if not ffmpeg or not os.path.isfile(manifest_path):
-        return False
-
-    ext = get_ext(manifest_path).lower()
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-    cmd = [ffmpeg, "-y"]
-    if ext == ".m3u8":
-        cmd += [
-            "-protocol_whitelist", "file,pipe,concat",
-            "-i", manifest_path,
-            "-c", "copy", "-bsf:a", "aac_adtstoasc",
-            output_path,
-        ]
-    elif ext == ".mpd":
-        cmd += ["-i", manifest_path, "-c", "copy", output_path]
-    else:
-        return False
-
-    result = _run_ffmpeg(cmd, timeout=300)
-    if result.returncode == 0:
-        return os.path.isfile(output_path) and os.path.getsize(output_path) > 0
-
-    # 清单合并失败 → 回退到分片 concat
-    manifest_dir = os.path.dirname(manifest_path)
-    seg_files = sorted(
-        os.path.join(manifest_dir, f)
-        for f in os.listdir(manifest_dir)
-        if f.endswith((".ts", ".m4s", ".m4v"))
-    )
-    if seg_files:
-        return merge_video_files(seg_files, output_path, ffmpeg)
-    return False
-
-
-def select_best_manifest(video_dir: str) -> str | None:
-    """从 video/ 目录中选出最佳清单:优先选子清单(非 master),最多分片的优先。
-
-    解决 master m3u8 被展开成多个子清单后重复合并的问题。
-    """
-    all_files = os.listdir(video_dir)
-    m3u8_files = [f for f in all_files if f.endswith(".m3u8")]
-    mpd_files = [f for f in all_files if f.endswith(".mpd")]
-    manifests = m3u8_files + mpd_files
-    if not manifests:
-        return None
-
-    ts_count = len([f for f in all_files if f.endswith(".ts")])
-    m4s_count = len([f for f in all_files if f.endswith((".m4s", ".m4v"))])
-    has_segments = ts_count > 0 or m4s_count > 0
-
-    if not has_segments:
-        # 没有分片文件,不需要合并
-        return None
-
-    if len(manifests) == 1:
-        return os.path.join(video_dir, manifests[0])
-
-    # 多个清单:如果有 TS 分片,直接用 concat,不需要清单
-    # 如果有 M4S 分片,也需要用 concat
-    # 只有在没有任何分片但有清单时才用清单
-    return None  # 交给分片合并
-
-
-def cleanup_segments(video_dir: str, merged_mp4: str | None = None) -> int:
-    """合并成功后删除分片文件(TS/M4S)和清单文件,只保留 MP4。
-
-    Returns:
-        删除的文件数
-    """
-    if not os.path.isdir(video_dir):
-        return 0
-
-    removed = 0
-    keep_exts = {".mp4", ".mp3", ".wav", ".aac", ".flac"}  # 保留的格式
-
-    for f in os.listdir(video_dir):
-        fp = os.path.join(video_dir, f)
-        if not os.path.isfile(fp):
-            continue
-        ext = get_ext(f).lower()
-        # 删除: TS/M4S/M4V 分片 + m3u8/mpd 清单 + concat.txt 临时文件
-        if ext in (".ts", ".m4s", ".m4v", ".m3u8", ".mpd") or f.endswith(".concat.txt"):
-            try:
-                os.remove(fp)
-                removed += 1
-            except OSError:
-                pass
-
-    return removed
-
-
 # ─────────────── 内部实现 ───────────────
 
 def _concat_ts(segments: list[str], output: str, ffmpeg: str) -> bool:
@@ -196,15 +131,19 @@ def _concat_ts(segments: list[str], output: str, ffmpeg: str) -> bool:
                 safe = seg.replace("'", "'\\''")
                 f.write(f"file '{safe}'\n")
 
-        cmd = [
+        base_cmd = [
             ffmpeg, "-y",
             "-f", "concat", "-safe", "0",
             "-i", list_file,
-            "-c", "copy", "-bsf:a", "aac_adtstoasc",
-            output,
+            "-c", "copy",
         ]
-        result = _run_ffmpeg(cmd, timeout=300)
-        return result.returncode == 0 and os.path.isfile(output) and os.path.getsize(output) > 0
+        # aac_adtstoasc 仅对 AAC 音轨有效;MP3/AC3 等 TS 用它会报错,
+        # 带 bsf 失败时去掉再试一次
+        for extra in (["-bsf:a", "aac_adtstoasc"], []):
+            result = _run_ffmpeg(base_cmd + extra + [output], timeout=300)
+            if result.returncode == 0 and os.path.isfile(output) and os.path.getsize(output) > 0:
+                return True
+        return False
     finally:
         try:
             os.remove(list_file)
@@ -213,30 +152,26 @@ def _concat_ts(segments: list[str], output: str, ffmpeg: str) -> bool:
 
 
 def _concat_fmp4(segments: list[str], output: str, ffmpeg: str) -> bool:
-    """合并 fMP4 (.m4s) 分片。"""
-    init_segs = [s for s in segments if "init" in os.path.basename(s).lower()]
-    media_segs = [s for s in segments if s not in init_segs]
-    ordered = init_segs + media_segs
+    """合并 fMP4 (.m4s) 分片:init 段 + 媒体段按序二进制拼接,再重封装为 MP4。
 
-    list_file = output + ".concat.txt"
+    不用 concat demuxer:单个 .m4s 缺少独立的文件头,ffmpeg 探测不了;
+    二进制拼接(init 的 moov + 各段的 moof/mdat)后就是一个合法的
+    fMP4 流,用 -c copy 重封装即可。
+    """
+    tmp = output + ".concat.mp4"
     try:
-        with open(list_file, "w", encoding="utf-8") as f:
-            for seg in ordered:
-                safe = seg.replace("'", "'\\''")
-                f.write(f"file '{safe}'\n")
+        with open(tmp, "wb") as out:
+            for seg in segments:
+                with open(seg, "rb") as f:
+                    shutil.copyfileobj(f, out, 1024 * 1024)
 
-        cmd = [
-            ffmpeg, "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", list_file,
-            "-c", "copy",
-            output,
-        ]
+        cmd = [ffmpeg, "-y", "-i", tmp, "-c", "copy", output]
         result = _run_ffmpeg(cmd, timeout=600)
         return result.returncode == 0 and os.path.isfile(output) and os.path.getsize(output) > 0
     finally:
         try:
-            os.remove(list_file)
+            if os.path.exists(tmp):
+                os.remove(tmp)
         except OSError:
             pass
 

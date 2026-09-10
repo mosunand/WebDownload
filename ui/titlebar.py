@@ -67,9 +67,22 @@ class _TitleButton(QPushButton):
             p.drawLine(int(cx + s), int(cy - s), int(cx - s), int(cy + s))
         elif self._kind == "min":  # 横线
             p.drawLine(int(cx - s), int(cy), int(cx + s), int(cy))
-        elif self._kind == "max":  # 方框
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(int(cx - s), int(cy - s), int(2 * s), int(2 * s))
+        elif self._kind == "max":
+            win = self.window()
+            maximized = (
+                win.is_maximized() if hasattr(win, "is_maximized")
+                else win.isMaximized()
+            )
+            if maximized:
+                # 还原:两个错位叠加的方框
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(int(cx - s + 2), int(cy - s + 2), int(2 * s), int(2 * s))
+                p.drawLine(int(cx - s), int(cy - s + 4), int(cx - s), int(cy + s))
+                p.drawLine(int(cx - s), int(cy - s + 4), int(cx + s - 4), int(cy - s + 4))
+                p.drawLine(int(cx + s - 4), int(cy - s + 4), int(cx + s - 4), int(cy + s))
+            else:
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(int(cx - s), int(cy - s), int(2 * s), int(2 * s))
         elif self._kind == "settings":  # 齿轮:实体圆 + 齿 + 中心孔
             import math
             from PySide6.QtCore import QPointF, QRectF

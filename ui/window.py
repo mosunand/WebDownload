@@ -26,7 +26,7 @@ from ui.titlebar import TitleBar
 from ui.widgets import Card, IOSSwitch, GlassButton, DragHandle
 from utils import glass
 from utils import config as app_config
-from utils.icon import get_app_icon
+from utils.icon import get_app_icon, setup_app_icons
 
 # 资源类型 -> 中文名 + 子目录名
 TYPE_META = {
@@ -318,6 +318,12 @@ class MainWindow(QWidget):
         self._refresh_dir_label()
         self.status_label.setText("设置已保存。")
 
+    def _apply_icon(self):
+        """按当前配置刷新应用/窗口/标题栏图标(设置里改了 icon_path 后调用)。"""
+        app = QApplication.instance()
+        if app is not None:
+            setup_app_icons(app, self, cfg=self._cfg)
+
     # ---------- 扫描 ----------
     def _normalized_url(self) -> str:
         url = self.url_edit.text().strip()
@@ -354,7 +360,9 @@ class MainWindow(QWidget):
         self._resources = result
         self._set_scanning_state(False)
         self._update_counts()
-        total = sum(len(v) for k, v in result.items() if k != "html")
+        # title / stream_playlists / html 不是资源 URL,不计入总数
+        resource_keys = ("images", "audio", "video", "css", "js")
+        total = sum(len(result.get(k, [])) for k in resource_keys)
         html_len = len(result.get("html", ""))
         self.status_label.setText(
             f"扫描完成:共 {total} 个资源"

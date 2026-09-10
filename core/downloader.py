@@ -69,6 +69,13 @@ class ConcurrentDownloader:
                                 on_progress(done, total)
                 if on_progress:
                     on_progress(done, total)
+                # 200 但 body 为空 → 无效文件,删掉并按失败处理
+                if done == 0:
+                    try:
+                        os.remove(save_path)
+                    except OSError:
+                        pass
+                    return False
             return True
         except Exception:
             try:
@@ -145,23 +152,23 @@ class ConcurrentDownloader:
 
             def task(item):
                 url, path = item
-                self._download_one(
+                ok = self._download_one(
                     client, url, path,
                     on_progress=(
                         (lambda d, t, _u=url: on_file_progress(_u, d, t))
                         if on_file_progress else None
                     ),
                 )
-                return url, path
+                return url, path, ok
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            pool = ThreadPoolExecutor(max_workers=self.max_workers)
+            try:
                 futures = {pool.submit(task, it): it for it in assigned}
                 for fut in as_completed(futures):
                     if self._global_stop.is_set():
                         break
                     try:
-                        url, path = fut.result()
-                        ok = os.path.exists(path) and os.path.getsize(path) > 0
+                        url, path, ok = fut.result()
                         if ok:
                             ok_count += 1
                         else:
@@ -172,5 +179,11 @@ class ConcurrentDownloader:
                         fail_count += 1
                         if on_file_done:
                             on_file_done(None, False, "")
+            finally:
+                # 取消时不再等待队列里还没执行的任务,让线程池尽快退出
+                if self._global_stop.is_set():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                else:
+                    pool.shutdown(wait=True)
 
         return ok_count, fail_count

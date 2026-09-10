@@ -22,14 +22,35 @@ import os
 # 从 core/scanner.py 往上退两级 → 项目根目录 (WebDownload/)
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 定位到 Tools/chromium-1140/chrome-win/chrome.exe
-CHROME_EXE = os.path.join(
-    _ROOT,
-    "Tools",
-    "chromium-1140",
-    "chrome-win",
-    "chrome.exe"
-)
+# 定位 Chromium:兼容两种目录布局
+#   1. Tools/chromium-1140/chrome-win/chrome.exe     (仓库内置布局)
+#   2. Tools/ms-playwright/chromium-*/chrome-win/... (mksoft.py 安装布局,
+#      PLAYWRIGHT_BROWSERS_PATH 指向 Tools/ms-playwright)
+def _find_chrome_exe() -> str | None:
+    candidates = [
+        os.path.join(_ROOT, "Tools", "chromium-1140", "chrome-win", "chrome.exe"),
+        os.path.join(_ROOT, "Tools", "chromium-1140", "chrome-linux", "chrome"),
+    ]
+    ms_dir = os.path.join(_ROOT, "Tools", "ms-playwright")
+    if os.path.isdir(ms_dir):
+        for d in sorted(os.listdir(ms_dir)):
+            if d.startswith("chromium-"):
+                candidates.insert(0, os.path.join(ms_dir, d, "chrome-win", "chrome.exe"))
+                candidates.append(os.path.join(ms_dir, d, "chrome-linux", "chrome"))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+CHROME_EXE = _find_chrome_exe()
+
+# 找不到直指的 chrome.exe 时,让 Playwright 走 ms-playwright 布局
+# (其默认下载目录;不设环境变量的话 Playwright 只会去用户目录找)
+if CHROME_EXE is None:
+    _ms_dir = os.path.join(_ROOT, "Tools", "ms-playwright")
+    if os.path.isdir(_ms_dir) and not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _ms_dir
 
 # 默认持久化用户数据目录(保留 Cookies / 登录态)
 _DEFAULT_USER_DATA = os.path.join(
@@ -147,7 +168,7 @@ class ResourceScanner:
 
     def __init__(
         self,
-        chrome_exe: str = CHROME_EXE,
+        chrome_exe: str | None = CHROME_EXE,
         timeout_ms: int = 90000,
         user_data_dir: str | None = None,
         scroll_rounds: int = 8,
@@ -292,15 +313,18 @@ class ResourceScanner:
                 pass
 
         # ---- 合并:网络拦截(已按 content-type 分类) + DOM 提取 ----
-        merged: dict[str, set[str]] = {
-            "images": set(), "audio": set(), "video": set(),
-            "css": set(), "js": set(),
+        # 用 dict(插入有序)去重而不是 set:video 要保持首次发现的顺序
+        # (网络拦截的到达顺序 ≈ 播放顺序),分片合并的兜底排序依赖它;
+        # 其他类别排序后展示
+        merged: dict[str, dict[str, None]] = {
+            "images": {}, "audio": {}, "video": {},
+            "css": {}, "js": {},
         }
         for cat in ("images", "audio", "video", "css", "js"):
             for u in result.get(cat, []):
                 nu = normalize_url(url, u)
                 if nu and not is_data_url(nu):
-                    merged[cat].add(nu)
+                    merged[cat][nu] = None
 
         for raw_cat, urls in dom_res.items():
             for u in urls:
@@ -313,33 +337,42 @@ class ResourceScanner:
                     # <a> 链接只有扩展名匹配才保留,丢弃页面内链
                     cat = classify(nu)
                     if cat in ("audio", "video"):
-                        merged[cat].add(nu)
+                        merged[cat][nu] = None
                 else:
                     cat = classify(nu) or raw_cat
                     if cat in merged:
-                        merged[cat].add(nu)
+                        merged[cat][nu] = None
 
         for cat in merged:
-            result[cat] = sorted(merged[cat])
+            if cat == "video":
+                result[cat] = list(merged[cat])
+            else:
+                result[cat] = sorted(merged[cat])
 
         # ---- 流媒体清单二次解析:HLS(.m3u8) / DASH(.mpd) ----
-        # 清单本身保留(可下载),同时把里面的 TS/M4S 分片也加进 video 列表
-        result["video"] = self._expand_stream_manifests(result["video"])
+        # 清单本身保留(可下载),同时把里面的 TS/M4S 分片也加进 video 列表;
+        # stream_playlists 记录每个清单的有序分片表,合并时按此顺序拼接
+        result["video"], result["stream_playlists"] = self._expand_stream_manifests(result["video"])
 
         return result
 
-    def _expand_stream_manifests(self, video_urls: list[str]) -> list[str]:
+    def _expand_stream_manifests(self, video_urls: list[str]) -> tuple[list[str], dict[str, list[str]]]:
         """把 video 列表里的 .m3u8/.mpd 清单解析成分片 URL,合并回列表。
 
         - 清单 URL 本身保留(用户可直接下载清单文件)
         - 解析出的分片(.ts/.m4s)追加到列表,便于并发下载
         - 解析失败不影响原清单下载
+
+        Returns:
+            (合并后的 video URL 列表, {清单 URL: 有序分片 URL 列表})
+            分片顺序即清单里的播放顺序,合并视频时按它拼接,不依赖文件名排序
         """
         if not video_urls:
-            return video_urls
+            return video_urls, {}
 
         out = list(video_urls)
         seen: set[str] = set(out)
+        playlists: dict[str, list[str]] = {}
         parsed_count = 0
 
         for u in video_urls:
@@ -350,6 +383,7 @@ class ResourceScanner:
             if not segments:
                 continue
             parsed_count += 1
+            playlists[u] = list(segments)
             for seg in segments:
                 if seg not in seen:
                     seen.add(seg)
@@ -361,4 +395,4 @@ class ResourceScanner:
         if parsed_count:
             print(f"[stream] 共展开 {parsed_count} 个流媒体清单,视频资源 {len(out)} 个")
 
-        return out
+        return out, playlists

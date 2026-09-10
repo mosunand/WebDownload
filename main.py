@@ -18,7 +18,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from ui.window import MainWindow
-from utils.icon import get_app_icon
 
 
 def main():
@@ -30,12 +29,8 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("WebDownload")
 
-    # 任务栏/窗口图标:自定义或程序生成的默认图标,窗口创建前设置才生效于任务栏
-    #app.setWindowIcon(get_app_icon())
-    #app.setWindowIcon(setup_app_icons(app, window, custom_path="./icon/logo.ico"))
-
-
     win = MainWindow()
+    # 窗口创建后设置图标才对标题栏/任务栏同时生效
     setup_app_icons(app, win, custom_path="./icon/logo.ico")
 
     win.show()

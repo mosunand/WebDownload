@@ -297,11 +297,10 @@ class IOSSwitch(QCheckBox):
             )
         p.end()
 
-    def mouseReleaseEvent(self, e):
-        # 整个控件区域都可点击切换
-        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
-            self.toggle()
-        super().mouseReleaseEvent(e)
+    # 点击切换完全交给 QAbstractButton 默认实现:
+    # 它的 hitButton() 对整个控件区域返回 True,无需手动 toggle()。
+    # (之前在这里手动 self.toggle() 再调 super(),会翻转两次,
+    #  表现为"点击开关没反应"。)
 
 
 # 兼容旧引用:FlatCheckBox 保留为 IOSSwitch 的别名(若别处仍在 import)

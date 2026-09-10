@@ -1,7 +1,11 @@
 """URL 规范化与资源分类工具。"""
 from __future__ import annotations
 
+import re
 from urllib.parse import urljoin, urlparse, urlunparse
+
+# 自然排序用:把字符串切成 文本/数字 交替的片段
+_NUM_SPLIT_RE = re.compile(r"(\d+)")
 
 # 各类资源扩展名表(小写,不含点)
 IMAGE_EXTS = {
@@ -108,6 +112,18 @@ def classify(url: str, content_type: str | None = None) -> str | None:
     if ext in JS_EXTS:
         return "js"
     return None
+
+
+def natural_key(name: str) -> list:
+    """自然排序 key:数字部分按数值比较,文本部分忽略大小写。
+
+    视频分片排序专用:'seg-2.ts' 应排在 'seg-10.ts' 之前,
+    而字典序会得到 seg-1, seg-10, seg-2 ... 导致合并后顺序错乱。
+    re.split 带捕获组保证下标奇偶一致(偶数位是文本、奇数位是数字),
+    因此不同 key 之间不会出现 str 与 int 直接比较。
+    """
+    parts = _NUM_SPLIT_RE.split(name)
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
 def safe_filename(url: str, fallback: str = "file") -> str:
