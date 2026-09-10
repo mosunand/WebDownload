@@ -33,9 +33,9 @@
 
 ---
 
-## 📸 截图
+## 📸 运行截图
 
-> *(放一张运行截图到这里,建议放在 `docs/screenshot.png`)*
+> *(![Tools](imgs/7a2978513b13fc796b5b77b7275ebfe5.png)*
 
 ---
 
@@ -60,6 +60,7 @@ pip install -r requirements.txt
 # 3. 项目已内置 Chromium(Tools/chromium-1140/),无需额外下载
 #    如需自行安装 Playwright 浏览器:
 # playwright install chromium
+# 我这里也提供了方法安装，下面有讲解
 ```
 
 **requirements.txt** 包含:
@@ -69,6 +70,12 @@ pip install -r requirements.txt
 | `PySide6` | 6.5.0+ | Qt6 GUI 框架(主窗口/自绘控件/信号槽) |
 | `playwright` | 1.40.0+ | 真浏览器渲染扫描 |
 | `httpx` | 0.25.0+ | 并发流式下载 |
+
+#### 安装chromium方便步骤：
+
+![Tools](imgs/f8c1ba7c60e23d5d1ee6b1d937db55b5.png)
+
+**下载这个Tools.zip文件，解压后整个文件覆盖住源代码里的Tools目录即可；**
 
 ### 运行
 
@@ -120,7 +127,7 @@ chmod +x start.sh
 
 
 
-<strong style="color:red;">如果需要打开某个按钮，例如“图片”按钮，不是通过点击按钮，而是通过<u>点击文字末尾，例如"片"字</u>，这样就可以进行开关这个按钮了</strong>
+一看就会，无需多言
 
 
 
@@ -213,10 +220,10 @@ Windows 的 DWM Acrylic / BlurBehind API 不支持分层窗口(`WS_EX_LAYERED`),
 
 ## ⚠️ 注意事项
 
-- **Chromium 体积较大** — `Tools/chromium-1140/` 约 300MB,克隆时注意
+- **Chromium 体积较大** — `Tools/chromium-1140/` 可以直接在网页端下载好，然后放在对应位置上即可使用
 - **毛玻璃仅限 Windows** — macOS/Linux 运行时回退为半透明渐变背景
 - **遵守 robots.txt 与版权** — 本工具仅用于合法的个人资源备份与学习研究,请勿用于侵犯版权或违反目标网站服务条款的用途
-- **登录数据** — `userdata/` 目录包含浏览器登录态,切勿提交到公开仓库
+- **登录数据** — `userdata/` 不要提交到公开仓库
 
 ---
 
@@ -228,19 +235,7 @@ Windows 的 DWM Acrylic / BlurBehind API 不支持分层窗口(`WS_EX_LAYERED`),
 
 ## 📧 联系方式
 
-如有问题，可以通过邮箱咨询，欢迎大家进行咨询
-
 - **Email**: moshuai1013@outlook.com
 
 ---
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request!
-
-1. Fork 本仓库
-2. 创建你的分支(`git checkout -b feature/amazing-feature`)
-3. 提交修改(`git commit -m 'Add amazing feature'`)
-4. 推送到分支(`git push origin feature/amazing-feature`)
-5. 开一个 Pull Request
 
